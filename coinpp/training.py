@@ -3,7 +3,15 @@ import coinpp.losses as losses
 import coinpp.metalearning as metalearning
 import torch
 import wandb
-
+import numpy as np
+import utils
+import os
+from math import ceil
+import logging
+import copy
+import sys
+from accelerate import Accelerator
+from tqdm import tqdm, trange
 
 class Trainer:
     def __init__(
@@ -13,6 +21,7 @@ class Trainer:
         args,
         train_dataset,
         test_dataset,
+        initial_dataset,
         patcher=None,
         model_path="",
     ):
@@ -34,17 +43,46 @@ class Trainer:
         self.args = args
         self.patcher = patcher
 
-        self.outer_optimizer = torch.optim.Adam(
-            self.func_rep.parameters(), lr=args.outer_lr
+        params = [param for name, param in self.func_rep.named_parameters()]
+        # self.outer_optimizer = torch.optim.Adam(
+        #     self.func_rep.parameters(), lr=args.outer_lr
+        # )
+
+        self.outer_optimizer1 = torch.optim.Adam(
+            params[:], lr=args.outer_lr
+        )
+        self.outer_optimizer2 = torch.optim.Adam(
+            params[22:], lr=args.outer_lr
+        )
+        self.outer_optimizer = self.outer_optimizer1
+        self.initial_optimizer = torch.optim.Adam(
+            params[:], lr=args.initial_lr, weight_decay=0.0001
         )
 
         self.train_dataset = train_dataset
         self.test_dataset = test_dataset
+        self.initial_dataset = initial_dataset
         self._process_datasets()
 
         self.model_path = model_path
         self.step = 0
         self.best_val_psnr = 0.0
+        self.num_accumulation = 20
+        self.initial_epoch = args.initial_epochs
+        
+        count = 0
+        self.base_dir = os.path.join(self.args.work_space,'imgs',f'base_net_width_{self.args.dim_hidden}_height_{self.args.num_layers}_use_latent_{self.args.use_latent}_accumulated_{self.args.accumulated}')
+        self.dir = os.path.join(self.base_dir, f'_{count}')
+        while os.path.exists(self.dir):
+            count += 1
+            self.dir = os.path.join(self.base_dir, f'_{count}')
+        os.makedirs(self.dir, exist_ok=True)
+        logfile = os.path.join(self.dir,'logfile')
+        LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+        logging.basicConfig(filename=logfile, level=logging.DEBUG, format=LOG_FORMAT)
+        file_handler = logging.FileHandler(logfile, mode="w")
+        self.logger = logging.getLogger(__name__)
+        self.logger.addHandler(file_handler)
 
     def _process_datasets(self):
         """Create dataloaders for datasets based on self.args."""
@@ -52,7 +90,7 @@ class Trainer:
             self.train_dataset,
             shuffle=True,
             batch_size=self.args.batch_size,
-            num_workers=self.args.num_workers,
+            num_workers=0,
             pin_memory=self.args.num_workers > 0,
         )
 
@@ -65,12 +103,23 @@ class Trainer:
             num_workers=self.args.num_workers,
         )
 
+        self.initial_dataloader = torch.utils.data.DataLoader(
+            self.initial_dataset,
+            shuffle=False,
+            batch_size=16 if self.patcher else self.args.batch_size,
+            num_workers=self.args.num_workers,
+        )
+
     def train_epoch(self):
         """Train model for a single epoch."""
+        block_num = 0
+        losses = []
+        psnrs = []
         for data in self.train_dataloader:
             data = data.to(self.args.device)
             coordinates, features = self.converter.to_coordinates_and_features(data)
-
+            block_num += features.shape[0]
+            
             # Optionally subsample points
             if self.args.subsample_num_points != -1:
                 # Coordinates have shape (batch_size, *, coordinate_dim)
@@ -98,28 +147,58 @@ class Trainer:
                 gradient_checkpointing=self.args.gradient_checkpointing,
             )
 
-            # Update parameters of base network
-            self.outer_optimizer.zero_grad()
-            outputs["loss"].backward(create_graph=False)
-            self.outer_optimizer.step()
+            if self.args.accumulated:
+                loss = outputs["loss"]/self.num_accumulation*features.shape[0]
+                losses.append(outputs["loss"])
+                psnrs.append(outputs["psnr"])
+                loss.backward(create_graph=False)
+                # Update parameters of base network
+                if block_num == self.num_accumulation:
+                    mean_loss = sum(losses)/len(losses)
+                    mean_psnr = sum(psnrs)/len(psnrs)
+                    self.outer_optimizer.step()
+                    block_num = 0
+                    self.outer_optimizer.zero_grad()
 
-            if self.step % self.args.validate_every == 0 and self.step != 0:
-                self.validation()
+                    # if self.step % self.args.validate_every == 0 and self.step != 0:
+                    #     self.validation()
+                    
+                    log_dict = {"loss": mean_loss, "psnr": mean_psnr}
+                    self.step += 1
+                    print(f'Step {self.step}, Loss {mean_loss:.4f}, PSNR {mean_psnr:.4f}')
+                    # if mean_psnr >= 20:
+                    #     self.outer_optimizer = self.outer_optimizer2
+                    losses=[]
+                    psnrs=[]
+                    self.logger.info(f'{log_dict}')
+                    if self.args.use_wandb:
+                        wandb.log(log_dict, step=self.step)
+            else:
+                self.outer_optimizer.zero_grad()
+                outputs["loss"].backward(create_graph=False)
+                # accelerator.backward(outputs["loss"])
+                self.outer_optimizer.step()
 
-            log_dict = {"loss": outputs["loss"].item(), "psnr": outputs["psnr"]}
+                # if self.step % self.args.validate_every == 0 and self.step != 0:
+                    # self.validation()
 
-            self.step += 1
+                log_dict = {"loss": outputs["loss"].item(), "psnr": outputs["psnr"]}
+                self.step += 1
+                print(f'Step {self.step}, Loss {log_dict["loss"]:.3f}, PSNR {log_dict["psnr"]:.3f}')
 
-            print(
-                f'Step {self.step}, Loss {log_dict["loss"]:.3f}, PSNR {log_dict["psnr"]:.3f}'
-            )
-
-            if self.args.use_wandb:
-                wandb.log(log_dict, step=self.step)
+                self.logger.info(f'{log_dict}')
+                if self.args.use_wandb:
+                    wandb.log(log_dict, step=self.step)
+            
+            if self.step % self.args.warm_up ==0 and self.step != 0:
+                new_learning_rate = min(8e-5, self.args.outer_lr + 3e-6)
+                for param_group in self.outer_optimizer.param_groups:
+                    param_group['lr'] = new_learning_rate
 
     def validation(self):
         """Run trained model on validation dataset."""
         print(f"\nValidation, Step {self.step}:")
+        
 
         # If num_validation_points is -1, validate on entire validation dataset,
         # otherwise validate on a subsample of points
@@ -128,7 +207,8 @@ class Trainer:
 
         # Initialize validation logging dict
         log_dict = {}
-
+        log_dict[f"\nValidation, Step"] = self.step
+        
         # Evaluate model for different numbers of inner loop steps
         for inner_steps in self.args.validation_inner_steps:
             log_dict[f"val_psnr_{inner_steps}_steps"] = 0.0
@@ -178,23 +258,38 @@ class Trainer:
                     log_dict[f"val_psnr_{inner_steps}_steps"] += psnr.item()
                     log_dict[f"val_loss_{inner_steps}_steps"] += mse.item()
                 else:
+                    func_rep = copy.deepcopy(self.func_rep)
                     coordinates, features = self.converter.to_coordinates_and_features(
                         data
                     )
-
-                    outputs = metalearning.outer_step(
-                        self.func_rep,
-                        coordinates,
-                        features,
-                        inner_steps=inner_steps,
-                        inner_lr=self.args.inner_lr,
-                        is_train=False,
-                        return_reconstructions=True,
-                        gradient_checkpointing=self.args.gradient_checkpointing,
-                    )
-
+                    
+                    for outer_step in range(5):
+                        outputs = metalearning.outer_step(
+                            self.func_rep,
+                            coordinates,
+                            features,
+                            inner_steps=inner_steps,
+                            inner_lr=self.args.inner_lr,
+                            is_train=True,
+                            return_reconstructions=True,
+                            gradient_checkpointing=self.args.gradient_checkpointing,
+                        )
+                        
+                        # Update parameters of base network
+                        self.outer_optimizer.zero_grad()
+                        outputs["loss"].backward(create_graph=False)
+                        self.outer_optimizer.step()
+                    self.func_rep = func_rep
                     log_dict[f"val_psnr_{inner_steps}_steps"] += outputs["psnr"]
                     log_dict[f"val_loss_{inner_steps}_steps"] += outputs["loss"].item()
+                    
+                    # draw blocks
+                    # os.makedirs(os.path.join(self.args.work_space,'imgs',f'base_net_width_{self.args.dim_hidden}_height_{self.args.num_layers}_use_latent_{self.args.use_latent}'), exist_ok=True)
+                    file_name1 = os.path.join(self.dir,f'step_{self.step}.png')
+                    file_name2 = os.path.join(self.dir,f'step_{self.step}_recon.png')
+                    features_recon = outputs["reconstructions"]
+                    utils.vtk_draw_blocks(features.reshape(features.shape[0],int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3)))).cpu(), off_screen=True, file_name=file_name1)
+                    utils.vtk_draw_blocks(features_recon.reshape(features.shape[0],int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3)))).cpu().detach().numpy(), off_screen=True, file_name=file_name2)
 
                 if not full_validation and i >= num_validation_batches - 1:
                     break
@@ -208,7 +303,7 @@ class Trainer:
                 log_dict[f"val_loss_{inner_steps}_steps"],
             )
             print(
-                f"Inner steps {inner_steps}, Loss {mean_loss:.3f}, PSNR {mean_psnr:.3f}"
+                f"Inner steps {inner_steps}, Loss {mean_loss:.5f}, PSNR {mean_psnr:.3f}"
             )
 
             # Use first setting of inner steps for best validation PSNR
@@ -260,5 +355,44 @@ class Trainer:
                     )
 
                 wandb.log(log_dict, step=self.step)
-
+        self.logger.info(f'{log_dict}')
         print("\n")
+
+    def initial_model(self):
+        for i in trange(self.initial_epoch):
+            for data in self.initial_dataloader:
+                data = data.to(self.args.device)
+                coordinates, features = self.converter.to_coordinates_and_features(data)
+
+                outputs = metalearning.outer_step(
+                    self.func_rep,
+                    coordinates,
+                    features,
+                    inner_steps=self.args.inner_steps,
+                    inner_lr=self.args.inner_lr,
+                    is_train=True,
+                    return_reconstructions=True,
+                    gradient_checkpointing=self.args.gradient_checkpointing,
+                )
+
+                self.initial_optimizer.zero_grad()
+                outputs["loss"].backward(create_graph=False)
+                self.initial_optimizer.step()
+                log_dict = {"loss": outputs["loss"].item(), "psnr": outputs["psnr"]}
+                self.step += 1
+                print(f'Step {self.step}, Loss {log_dict["loss"]:.3f}, PSNR {log_dict["psnr"]:.3f}')
+
+                # if self.step % self.args.warm_up ==0 and self.step != 0:
+                #     new_learning_rate = min(8e-5, self.args.outer_lr + 3e-6)
+                #     for param_group in self.outer_optimizer.param_groups:
+                #         param_group['lr'] = new_learning_rate
+            if self.step % 100 == 0 and self.step != 0:
+                features_recon = outputs["reconstructions"]
+                OriginVsReconsturct = [features.reshape(int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3)))).cpu(),
+                                    features_recon.reshape(int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3)))).cpu().detach().numpy()]
+                utils.vtk_draw_blocks(OriginVsReconsturct)
+
+
+        self.step = 0
+        
+        # utils.vtk_draw_blocks(features_recon.reshape(features.shape[0],int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3))),int(ceil(features.shape[1]**(1.0/3)))).cpu().detach().numpy())

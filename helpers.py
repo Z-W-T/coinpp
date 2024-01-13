@@ -5,9 +5,11 @@ import data.era5 as era5
 import data.fastmri as fastmri
 import data.image as image
 import data.vimeo90k as vimeo90k
+import data.Asteroid as Asteroid
 import torchvision
 import yaml
 from pathlib import Path
+import utils
 
 
 def get_dataset_root(dataset_name: str):
@@ -31,6 +33,9 @@ def dataset_name_to_dims(dataset_name):
         dim_out = 1
     if dataset_name == "librispeech":
         dim_in = 1
+        dim_out = 1
+    if dataset_name == "Asteroid_train":
+        dim_in = 4
         dim_out = 1
     return dim_in, dim_out
 
@@ -62,6 +67,7 @@ def get_datasets_and_converter(args, force_no_random_crop=False):
             train_dataset = image.MNIST(
                 root=get_dataset_root("mnist"),
                 train=True,
+                download=True,
                 transform=random_crop if use_patching else None,
             )
         if args.test_dataset == "mnist":
@@ -78,12 +84,14 @@ def get_datasets_and_converter(args, force_no_random_crop=False):
             train_dataset = image.CIFAR10(
                 root=get_dataset_root("cifar10"),
                 train=True,
+                download=True,
                 transform=torchvision.transforms.Compose(transforms),
             )
         if args.test_dataset == "cifar10":
             test_dataset = image.CIFAR10(
                 root=get_dataset_root("cifar10"),
                 train=False,
+                download=True,
                 transform=torchvision.transforms.ToTensor(),
             )
 
@@ -116,6 +124,7 @@ def get_datasets_and_converter(args, force_no_random_crop=False):
                 root=get_dataset_root("fastmri"),
                 split="train",
                 challenge="multicoil",
+                download=True,
                 patch_shape=args.patch_shape
                 if (use_patching and not force_no_random_crop)
                 else -1,
@@ -125,6 +134,7 @@ def get_datasets_and_converter(args, force_no_random_crop=False):
             test_dataset = fastmri.FastMRI(
                 root=get_dataset_root("fastmri"),
                 split="val",
+                download=True,
                 challenge="multicoil",
             )
 
@@ -173,18 +183,37 @@ def get_datasets_and_converter(args, force_no_random_crop=False):
                 patch_shape=args.patch_shape[0]
                 if (use_patching and not force_no_random_crop)
                 else -1,
-                num_secs=3,
+                num_secs=1,
                 download=True,
             )
         if args.test_dataset == "librispeech":
             test_dataset = audio.LIBRISPEECH(
                 root=get_dataset_root("librispeech"),
                 url="test-clean",
-                num_secs=3,
+                num_secs=1,
                 download=True,
             )
+    
+    if  "Asteroid_train" in (args.train_dataset, args.test_dataset):
+        converter = conversion.Converter("volume")
 
-    return train_dataset, test_dataset, converter
+        if args.train_dataset == "Asteroid_train":
+            asteroid = Asteroid.Asteroids(root=get_dataset_root("Asteroid_train"), attr_name='v02')
+            asteroid.read_data()
+            utils.vtk_draw_blocks(asteroid.get_volume_data())
+            blocks = Asteroid.Blocks(asteroid.get_volume_data(),asteroid.get_volume_res())
+            train_dataset = Asteroid.MetaDataset(blocks.generate_data_block(args.block_size, args.block_gen_method, args.block_num), args.maml_chunk_num)
+            initial_dataset = Asteroid.MetaDataset(blocks.generate_data_block([100,100,100], 'same', args.block_num), args.maml_chunk_num)
+        if args.test_dataset == "Asteroid_test":
+            asteroid = Asteroid.Asteroids(root=get_dataset_root("Asteroid_test"), attr_name='v02')
+            asteroid.read_data()
+            blocks = Asteroid.Blocks(asteroid.get_volume_data(),asteroid.get_volume_res())
+            test_dataset = Asteroid.MetaDataset(blocks.generate_data_block(args.block_size, args.block_gen_method, int(args.block_num/5)), args.maml_chunk_num)
+
+    if "Asteroid_train" in (args.train_dataset, args.test_dataset):
+        return train_dataset, test_dataset, converter, initial_dataset
+    else:
+        return train_dataset, test_dataset, converter
 
 
 def get_model(args):
@@ -202,4 +231,5 @@ def get_model(args):
         latent_dim=args.latent_dim,
         modulation_net_dim_hidden=args.modulation_net_dim_hidden,
         modulation_net_num_layers=args.modulation_net_num_layers,
+        GPU=args.GPU
     ).to(args.device)

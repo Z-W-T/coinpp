@@ -171,12 +171,14 @@ class ModulatedSiren(Siren):
         w0=30.0,
         w0_initial=30.0,
         use_bias=True,
+        use_transform=True,
         modulate_scale=False,
         modulate_shift=True,
         use_latent=False,
         latent_dim=64,
         modulation_net_dim_hidden=64,
         modulation_net_num_layers=1,
+        GPU=0,
     ):
         super().__init__(
             dim_in,
@@ -194,6 +196,8 @@ class ModulatedSiren(Siren):
         self.modulate_shift = modulate_shift
         self.w0 = w0
         self.w0_initial = w0_initial
+
+        self.GPU = GPU
 
         # We modulate features at every *hidden* layer of the base network and
         # therefore have dim_hidden * (num_layers - 1) modulations, since the
@@ -214,6 +218,12 @@ class ModulatedSiren(Siren):
         else:
             self.modulation_net = Bias(num_modulations)
 
+        if use_transform:
+            self.transform_net = Transformation(
+                input_dim=4,
+                output_dim=4
+            )
+
         # Initialize scales to 1 and shifts to 0 (i.e. the identity)
         if not use_latent:
             if self.modulate_shift and self.modulate_scale:
@@ -231,27 +241,19 @@ class ModulatedSiren(Siren):
 
         self.num_modulations = num_modulations
 
-    def modulated_forward(self, x, latent):
-        """Forward pass of modulated SIREN model.
-
-        Args:
-            x (torch.Tensor): Shape (batch_size, *, dim_in), where * refers to
-                any spatial dimensions, e.g. (height, width), (height * width,)
-                or (depth, height, width) etc.
-            latent (torch.Tensor): Shape (batch_size, latent_dim). If
-                use_latent=False, then latent_dim = num_modulations.
-
-        Returns:
-            Output features of shape (batch_size, *, dim_out).
-        """
-        # Extract batch_size and spatial dims of x, so we can reshape output
+    def forward(self, x, latent):
         x_shape = x.shape[:-1]
         # Flatten all spatial dimensions, i.e. shape
         # (batch_size, *, dim_in) -> (batch_size, num_points, dim_in)
         x = x.view(x.shape[0], -1, x.shape[-1])
-
+        offset = torch.ones(x.shape[0], x.shape[1], 1).to(f"cuda:{self.GPU}")
+        x_with_offset = torch.cat((x,offset), dim=2)
         # Shape (batch_size, num_modulations)
         modulations = self.modulation_net(latent)
+
+        # Transformation (batch_size, *, dim_in)
+        # x = self.transform_net(x_with_offset)
+        x = x_with_offset
 
         # Split modulations into shifts and scales and apply them to hidden
         # features.
@@ -277,6 +279,69 @@ class ModulatedSiren(Siren):
             else:
                 shift = 0.0
 
+            # x = x.type(torch.float32)
+            x = module.linear(x)
+            x = scale * x + shift  # Broadcast scale and shift across num_points
+            x = module.activation(x)  # (batch_size, num_points, dim_hidden)
+
+            idx = idx + self.dim_hidden
+
+        # Shape (batch_size, num_points, dim_out)
+        out = self.last_layer(x)
+        # Reshape (batch_size, num_points, dim_out) -> (batch_size, *, dim_out)
+        return out.view(*x_shape, out.shape[-1])
+
+    def modulated_forward(self, x, latent):
+        """Forward pass of modulated SIREN model.
+
+        Args:
+            x (torch.Tensor): Shape (batch_size, *, dim_in), where * refers to
+                any spatial dimensions, e.g. (height, width), (height * width,)
+                or (depth, height, width) etc.
+            latent (torch.Tensor): Shape (batch_size, latent_dim). If
+                use_latent=False, then latent_dim = num_modulations.
+
+        Returns:
+            Output features of shape (batch_size, *, dim_out).
+        """
+        # Extract batch_size and spatial dims of x, so we can reshape output
+        x_shape = x.shape[:-1]
+        # Flatten all spatial dimensions, i.e. shape
+        # (batch_size, *, dim_in) -> (batch_size, num_points, dim_in)
+        x = x.view(x.shape[0], -1, x.shape[-1])
+        offset = torch.ones(x.shape[0], x.shape[1], 1).to(f"cuda:{self.GPU}")
+        x_with_offset = torch.cat((x,offset), dim=2)
+        # Shape (batch_size, num_modulations)
+        modulations = self.modulation_net(latent)
+
+        # Transformation (batch_size, *, dim_in)
+        x = self.transform_net(x_with_offset)
+
+        # Split modulations into shifts and scales and apply them to hidden
+        # features.
+        mid_idx = (
+            self.num_modulations // 2
+            if (self.modulate_scale and self.modulate_shift)
+            else 0
+        )
+        idx = 0
+        for module in self.net:
+            if self.modulate_scale:
+                # Shape (batch_size, 1, dim_hidden). Note that we add 1 so
+                # modulations remain zero centered
+                scale = modulations[:, idx : idx + self.dim_hidden].unsqueeze(1) + 1.0
+            else:
+                scale = 1.0
+
+            if self.modulate_shift:
+                # Shape (batch_size, 1, dim_hidden)
+                shift = modulations[
+                    :, mid_idx + idx : mid_idx + idx + self.dim_hidden
+                ].unsqueeze(1)
+            else:
+                shift = 0.0
+
+            # x = x.type(torch.float32)
             x = module.linear(x)
             x = scale * x + shift  # Broadcast scale and shift across num_points
             x = module.activation(x)  # (batch_size, num_points, dim_hidden)
@@ -349,3 +414,35 @@ if __name__ == "__main__":
     out = model(x)
     out = model.modulated_forward(x, latent)
     print(out.shape)
+
+class Transformation(nn.Module):
+    """transform xyz.
+
+    Args:
+        input_dim:int
+        output_dim:int
+    """
+    def __init__(self, input_dim, output_dim, n_layers = 2):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.n_layers = n_layers
+
+        self.net = nn.ModuleList()
+        for i in range(self.n_layers):
+            self.net.append(nn.Linear(input_dim, output_dim))
+        self.init_weight()
+
+    def init_weight(self):
+        for layer in self.net:
+            identity_matrix = torch.eye(4)
+            layer.weight.data  = identity_matrix
+            layer.bias.data.fill_(0)
+        layer.weight.data += torch.eye(4)/10
+
+    def forward(self, input):
+        out = input
+        for index, layer in enumerate(self.net):
+            out = layer(out)
+        return out

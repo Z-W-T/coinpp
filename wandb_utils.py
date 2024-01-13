@@ -2,7 +2,8 @@ import torch
 import wandb
 from coinpp.patching import Patcher
 from helpers import get_model
-
+from main import add_arguments
+import argparse
 
 def load_model(wandb_run_path, device):
     """Load a trained model.
@@ -35,6 +36,15 @@ def load_model(wandb_run_path, device):
         patcher = Patcher(args.patch_shape)
     return model, args, patcher
 
+def load_local_model(wandb_run_path, device):
+    parser = argparse.ArgumentParser(fromfile_prefix_chars="@")
+    add_arguments(parser)
+    args = parser.parse_args()
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    state_dict = torch.load('/home/WeiTeng/coinpp/coinpp/models/2023-11-30_06-35-35')
+    model = get_model(args)
+    model.load_state_dict(state_dict)
+    return model, args, None
 
 def load_modulations(wandb_run_path, filename, device):
     """Load a set of modulations.

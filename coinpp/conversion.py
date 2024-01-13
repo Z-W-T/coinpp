@@ -1,5 +1,5 @@
 import torch
-
+import numpy as np
 
 class Converter:
     """Class that converts data to coordinates and features and back.
@@ -13,7 +13,7 @@ class Converter:
     """
 
     def __init__(self, data_type="image"):
-        assert data_type in ("image", "mri", "era5", "audio")
+        assert data_type in ("image", "mri", "era5", "audio", "volume")
         self.data_type = data_type
         self.coordinates = None
 
@@ -75,6 +75,18 @@ class Converter:
                 coordinates = self.coordinates
                 features = data2features(data, batched=False)
             return coordinates, features
+        
+        elif self.data_type == "volume":
+            # data shape: [batch_size, spatial_size(w*h*d), coordinate_shape + feature_shape]
+            data = data.cpu()
+            coordinates = data[...,:3]
+            features = data[...,-1].unsqueeze(-1)
+            # if self.coordinates == None:
+            #     # Coordinate shape (coordinate_shape, len(coordinate_shape))
+            #     self.coordinates = shape2coordinates(data.shape[-3:]).to(data.device)
+            # coordinates = self.coordinates
+            # features = data2features(data, batched=False)
+            return coordinates.type(torch.float32).to("cuda"), features.type(torch.float32).to("cuda")
 
     def to_data(self, coordinates, features):
         """

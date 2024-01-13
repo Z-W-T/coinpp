@@ -128,7 +128,7 @@ def compute_modulations(
 if __name__ == "__main__":
     import argparse
     import wandb
-    from wandb_utils import load_model
+    from wandb_utils import load_model, load_local_model
 
     parser = argparse.ArgumentParser()
 
@@ -181,7 +181,7 @@ if __name__ == "__main__":
 
     # Compute modulations
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, model_args, patcher = load_model(args.wandb_run_path, device)
+    model, model_args, patcher = load_local_model(args.wandb_run_path, device)
     modulations = compute_modulations(
         model,
         model_args,
@@ -194,8 +194,8 @@ if __name__ == "__main__":
 
     # Save modulations locally and then upload them to the wandb run
     if args.store:
-        run_id = args.wandb_run_path.split("/")[-1]
-        local_dir = f"wandb/{run_id}"
+        run_id = 0
+        local_dir = f"modulations/{run_id}"
         dataset_split = "train" if args.use_train_dataset else "test"
         filename = f"modulations_{dataset_split}_{args.inner_steps}_steps.pt"
         torch.save(modulations, f"{local_dir}/{filename}")

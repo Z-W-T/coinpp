@@ -7,6 +7,8 @@ import wandb
 from coinpp.patching import Patcher
 from coinpp.training import Trainer
 from pathlib import Path
+from datetime import datetime
+from tqdm import tqdm, trange
 
 
 def add_arguments(parser):
@@ -80,7 +82,12 @@ def add_arguments(parser):
     )
 
     parser.add_argument(
-        "--outer_lr", help="Learning rate for the outer loop.", type=float, default=3e-6
+        "--initial_lr", help="Learning rate for the initial loop.", type=float, default=3e-5
+    )
+
+
+    parser.add_argument(
+        "--outer_lr", help="Learning rate for the outer loop.", type=float, default=3e-5
     )
 
     parser.add_argument(
@@ -94,6 +101,8 @@ def add_arguments(parser):
     parser.add_argument("--batch_size", type=int, default=16)
 
     parser.add_argument("--num_epochs", type=int, default=100)
+    
+    parser.add_argument("--initial_epochs", type=int, default=1000)
 
     parser.add_argument(
         "--train_dataset",
@@ -106,6 +115,7 @@ def add_arguments(parser):
             "era5",
             "vimeo90k",
             "librispeech",
+            "Asteroid_train",
         ),
     )
 
@@ -120,6 +130,7 @@ def add_arguments(parser):
             "era5",
             "vimeo90k",
             "librispeech",
+            "Asteroid_test",
         ),
     )
 
@@ -174,6 +185,27 @@ def add_arguments(parser):
         default=-1,
     )
 
+    parser.add_argument(
+        "--GPU",
+        help="select specific GPU",
+        type=int,
+        default=0,
+    )
+    
+    parser.add_argument(
+        "--accumulated",
+        help="select grad calculation way",
+        type=int,
+        default=0,
+    )
+    
+    parser.add_argument(
+        "--warm_up",
+        help="warm up steps determine outer_lr",
+        type=int,
+        default = 1000,
+    )
+    
     # Wandb arguments
     parser.add_argument(
         "--use_wandb",
@@ -200,6 +232,41 @@ def add_arguments(parser):
         default=None,
     )
 
+    # Asteroid arguments
+    parser.add_argument(
+        "--block_size",
+        help="size of data block",
+        type=int,
+        default=[50,50,50],
+        nargs='+'
+    )
+
+    parser.add_argument(
+        '--block_gen_method', 
+        type=str, 
+        default='random',
+        help='generate data block method'
+    )
+
+    parser.add_argument(
+        '--block_num', 
+        type=int, 
+        default=256,
+        help='block num per timestamp')
+    
+    parser.add_argument(
+        '--maml_chunk_num', 
+        type=int, 
+        default=10,
+        help='divide block into maml_chunk_num pieces')
+    
+    # File arguments
+    parser.add_argument(
+        '--work_space',
+        type=str,
+        default=os.getcwd(),
+        help='base path'
+    )
 
 def main(args):
     if args.use_wandb:
@@ -226,9 +293,11 @@ def main(args):
         torch.cuda.manual_seed_all(args.seed)
 
     # Build datasets, converters and model
-    train_dataset, test_dataset, converter = helpers.get_datasets_and_converter(args)
+    train_dataset, test_dataset, converter, initial_dataset = helpers.get_datasets_and_converter(args)
     model = helpers.get_model(args)
-
+    # model_path = '/home/WeiTeng/coinpp/coinpp/models/2023-09-25_07-09-37'
+    # loaded_state_dict = torch.load(model_path)
+    # model.load_state_dict(loaded_state_dict)
     print(model)
     print(args)
 
@@ -250,13 +319,24 @@ def main(args):
         args=args,
         train_dataset=train_dataset,
         test_dataset=test_dataset,
+        initial_dataset=initial_dataset,
         patcher=patcher,
         model_path=model_path,
     )
 
-    for epoch in range(args.num_epochs):
+    # print("initial begin")
+    # trainer.initial_model()
+    # print("initial end")
+
+    for epoch in trange(args.num_epochs):
         print(f"\nEpoch {epoch + 1}:")
         trainer.train_epoch()
+        
+    # 指定保存路径
+    save_path = 'coinpp/models/'+datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    # 保存模型
+    torch.save(model.state_dict(), save_path)
 
 
 if __name__ == "__main__":
@@ -264,4 +344,5 @@ if __name__ == "__main__":
     add_arguments(parser)
     args = parser.parse_args()
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    torch.cuda.set_device(args.GPU)
     main(args)

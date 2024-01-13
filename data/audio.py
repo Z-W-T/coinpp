@@ -46,6 +46,7 @@ class LIBRISPEECH(torchaudio.datasets.LIBRISPEECH):
         # Extract only first num_waveform_samples from waveform
         if self.num_secs != -1:
             # Shape (channels, num_waveform_samples)
+            # print(datapoint.shape)
             datapoint = datapoint[:, : self.num_waveform_samples]
 
         if self.random_crop:

@@ -1,7 +1,9 @@
 import coinpp.losses as losses
 import torch
 import torch.utils.checkpoint as cp
-
+from torchsummary import summary
+import sys
+from torchviz import make_dot
 
 def inner_loop(
     func_rep,
@@ -77,11 +79,12 @@ def inner_loop_step(
         loss = losses.mse_fn(features_recon, features) * batch_size
         # If we are training, we should create graph since we will need this to
         # compute second order gradients in the MAML outer loop
-        grad = torch.autograd.grad(
+        grad =torch.autograd.grad(
             loss,
             modulations,
             create_graph=is_train and not detach,
         )[0]
+        # make_dot(grad).render("compute_graph")
     # Perform single gradient descent step
     return modulations - inner_lr * grad
 

@@ -1,6 +1,8 @@
-mnist: ../datasets/MNIST
-cifar10: ../datasets/CIFAR10
-kodak: ../datasets/kodak
-fastmri: ../datasets/fastmri
-era5: ../datasets/era5
-librispeech: ../datasets/librispeech
+mnist: ./datasets/MNIST
+cifar10: ./datasets/CIFAR10
+kodak: ./datasets/kodak
+fastmri: ./datasets/fastmri
+era5: ./datasets/era5
+librispeech: ./datasets/librispeech
+Asteroid_train: ./datasets/Asteroid/train
+Asteroid_test: ./datasets/Asteroid/test
