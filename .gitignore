@@ -1,0 +1,8 @@
+_pycache_/
+.vscode/
+coinpp/__pycache__/
+configs/
+datasets/
+imgs/
+wandb/
+
